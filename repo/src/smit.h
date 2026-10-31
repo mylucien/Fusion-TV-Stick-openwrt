@@ -37,6 +37,10 @@ extern bool smit_in_probe;
 void smit_schedule_recovery(struct usb_device *udev);
 
 int smit_reset(struct usb_device *udev);
+/* 把 IN 管道里残留的包抽掉（内部就是 smit_drain_in）。
+ * probe 里判完冷热、重发唤醒包之前调用，免得把上一条探针的残留应答
+ * 当成这一次的答复。 */
+void smit_flush_in(struct usb_device *udev);
 int smit_set(struct usb_device *udev, u8 req, u8 *data, unsigned int len, int need_complete_flag);
 int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount);
 int smit_init(struct usb_device *udev, u8 *dtmb);

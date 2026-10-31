@@ -197,6 +197,14 @@ static void smit_prepare(struct usb_device *udev)
 		smit_drain_in(udev);
 }
 
+/* 给 probe 用的公开版本：判完冷热、重发唤醒包之前先把 IN 抽干净。
+ * 必须持有 smit_cmd_lock 之外调用 —— probe 阶段没有并发 ioctl，
+ * 也不会有 in-flight 的应答，所以这里不需要加锁。 */
+void smit_flush_in(struct usb_device *udev)
+{
+	smit_drain_in(udev);
+}
+
 /* 公共入口统一在这里判定链路健康度：连续 N 次事务在传输层失败，
  * 说明芯片已经卡死，交给上层复位重新枚举（不用拔插）。
  * 协议级错误码（-1xxx，设备回了怪数据）不算链路故障，不触发复位。 */
