@@ -391,8 +391,15 @@ static int __smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
   memcpy(out, smit.data, copy);
 
   /* 完成标志的两个 0x80 是紧跟在**设备自报的载荷**后面的，所以定位必须
-   * 用 dlen，不能用钳位后的 copy，否则偏移就整体错了。 */
-  if ( ( dlen >= actual_length || smit.data[dlen] != 0x80 || smit.data[dlen + 3] != 0x80 ) && checkcount > 0)
+   * 用 dlen，不能用钳位后的 copy，否则偏移就整体错了。
+   *
+   * 边界要按 "包头 4 字节 + dlen" 算，和 __smit_set() 里的
+   * (datalen + 4) >= actual_length 保持同一套算法。原来这边写的是
+   * dlen >= actual_length，少算了 4 字节包头，两个函数对"同一个包够不够长"
+   * 给出不同答案。目前两种写法行为等价（未收到的字节是 SMIT_PACK 零初始化
+   * 出来的 0，不会等于 0x80，所以漏判也会被后面的比较抓住），纯粹是
+   * 一致性 —— 但这类"两处算同一件事却算法不同"的地方，改一处就会露馅。 */
+  if ( ( dlen + 4 >= actual_length || smit.data[dlen] != 0x80 || smit.data[dlen + 3] != 0x80 ) && checkcount > 0)
   {
       int chk = __smit_check(udev, checkcount);
 

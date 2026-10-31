@@ -49,12 +49,19 @@ static struct icast_fe_config icast_config = {
  * diag_probe    : probe 时打印设备描述符和 vendor control 请求的应答
  * autorecover   : 命令通道连续失败时自动复位芯片重新枚举（默认开）
  * settle_ms     : 唤醒成功后等多久再发第一条命令（让应用固件启动完）
+ * reset_on_cold : 冷芯片（module_init 探活超时）时是否立刻复位。默认开。
+ *                 关掉它可以省掉实测 108s 的重枚举，让 probe 用 wake 顶上；
+ *                 但那条路径是"ping 已经把 OUT FIFO 弄脏、还不复位就去发
+ *                 唤醒包"，真机上从来没验证过（历史上冷启动能过，都是
+ *                 ping 后面跟着一次复位）。所以默认保持现场已知行为，
+ *                 这个参数留给冷启动实验。
  */
 bool smit_trace;
 bool smit_autorecover = true;
 static bool smit_skip_wake;
 static bool smit_reset_on_exit;
 static bool smit_diag_probe;
+static bool smit_reset_on_cold = true;
 
 /* 唤醒包应答之后、固件真正能处理业务命令之前的空窗。
  * 实测撞过一次：wake answered 0ms，紧接着 560ms 内 cmd0 仍超时，
@@ -77,6 +84,8 @@ module_param_named(autorecover, smit_autorecover, bool, 0644);
 MODULE_PARM_DESC(autorecover, "reset the chip to re-enumerate when the command channel dies");
 module_param_named(settle_ms, smit_settle_ms, int, 0644);
 MODULE_PARM_DESC(settle_ms, "wait this long after the wake-up before the first command");
+module_param_named(reset_on_cold, smit_reset_on_cold, bool, 0644);
+MODULE_PARM_DESC(reset_on_cold, "reset the chip when module_init finds it cold (default on; 0 = let probe wake it, unverified on real hardware)");
 
 static int icast_frontend_attach(struct dvb_usb_adapter *adap)
 {
@@ -296,6 +305,28 @@ static int smit_ping(struct usb_device *udev)
 	return smit_set(udev, 0x82, cmd0, 1, 0);
 }
 
+/* ping 的返回值怎么解读，决定要不要给芯片发唤醒包。
+ *
+ * 只有"芯片完全没回话"（超时 / 端点 stall）才算冷。其余 errno 一律不能当冷：
+ *   -ENOMEM          : smit_usb_bulk_msg 里 kmalloc 失败，主机侧就没发出去
+ *   -EPROTO          : 总线协议错，常见于线材/供电抖一下
+ *   -EAGAIN / -EINTR : 映射失败或被信号打断
+ * 误判的代价是不对称的：唤醒包对热芯片是毒药，会把固件打死、只有 vendor
+ * reset 能救（而 reset 在有的批次上要十几分钟）；对一颗其实冷着的芯片，
+ * 晚一次唤醒只是浪费一次机会。所以宁可漏判，不可误判。
+ */
+static bool smit_ping_is_cold(int ret)
+{
+	return ret == -ETIMEDOUT || ret == -EPIPE;
+}
+
+/* dvb_usb_device_init 失败时要不要补一刀复位：只有总线级故障值得。
+ * attach / 内存 / adapter 注册失败这类主机侧问题，复位芯片解决不了。 */
+static bool smit_is_bus_fault(int ret)
+{
+	return ret == -ETIMEDOUT || ret == -EPIPE || ret == -EPROTO;
+}
+
 /* ---- 复位代价判定 -----------------------------------------------------
  *
  * 同一行 smit_reset() 在两支同型号棒子上代价差两个数量级：
@@ -313,11 +344,15 @@ static int smit_ping(struct usb_device *udev)
 #define SMIT_VERDICT_MAX	4
 #define SMIT_PORT_LEN		12
 
+/* 0444：这是个"写错就静默失效"的安全阀，读得到就够了。
+ * 留成 0644 的话，运行时 echo 进去会和 probe / 自愈里的解析并发，
+ * 没有锁，读到半截字符串的后果是"匹配不上 -> 复位照发"，
+ * 而那可能是一支要等十几分钟的棒子。改它请重新 insmod（热芯片 0.1s）。 */
 static char smit_costly_ports[64];
 module_param_string(reset_costly_ports, smit_costly_ports,
-		    sizeof(smit_costly_ports), 0644);
+		    sizeof(smit_costly_ports), 0444);
 MODULE_PARM_DESC(reset_costly_ports,
-	"comma separated devpaths (e.g. 1-1,3-1) where resetting the chip costs minutes");
+	"comma separated ports (e.g. 1-1,3-1) where resetting the chip costs minutes");
 
 static struct {
 	char port[SMIT_PORT_LEN];
@@ -338,21 +373,30 @@ static void smit_portname(struct usb_device *udev, char *out, size_t len)
 		 udev->devpath ? udev->devpath : "?");
 }
 
-/* 人工钉死的端口表：逗号分隔，允许前后空格 */
+/* 人工钉死的端口表：逗号分隔，允许前后空格。
+ *
+ * 尾随空格必须一起算掉：原来只跳前导空格，token 长度把尾随空格也数进去了，
+ * 于是 "1-1 ,3-1" 里 1-1 匹配失败、"1-1, 3-1 " 里 3-1 匹配失败 —— 而这个参数
+ * 是绕开分钟级复位的唯一开关，写错一个空格就静默失效、复位照发。
+ * （用 strlen(port) 当长度是另一条线：它不含空格，所以只修剪 token 侧就够。） */
 static bool smit_port_pinned_costly(const char *port)
 {
 	const char *p = smit_costly_ports;
 	int n = strlen(port);
 
 	while (*p) {
-		const char *start;
+		const char *start, *end;
 
-		while (*p == ',' || *p == ' ')
+		while (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n')
 			p++;
 		start = p;
 		while (*p && *p != ',')
 			p++;
-		if (p - start == n && !strncmp(start, port, n))
+		end = p;
+		while (end > start && (end[-1] == ' ' || end[-1] == '\t' ||
+				       end[-1] == '\n' || end[-1] == '\r'))
+			end--;
+		if (end - start == n && !strncmp(start, port, n))
 			return true;
 	}
 	return false;
@@ -462,7 +506,12 @@ static bool smit_try_reset(struct usb_device *udev, const char *why)
 	snprintf(smit_pending_port, sizeof(smit_pending_port), "%s", port);
 	smit_pending_ok = false;
 	smit_reset(udev);
-	schedule_delayed_work(&smit_reset_watch, msecs_to_jiffies(SMIT_VERDICT_MS));
+	/* 必须用 mod_ 而不是 schedule_：schedule_delayed_work 对已经排队的
+	 * work 直接返回 false，不会重新计时。两次复位相隔不到 20s 时，
+	 * 第二次复位的观察窗口会被第一次的残留计时截短，慢一点的设备
+	 * 就会被误判成"昂贵"——而错误判定的后果是以后再也不复位它。 */
+	mod_delayed_work(system_wq, &smit_reset_watch,
+			 msecs_to_jiffies(SMIT_VERDICT_MS));
 	return true;
 }
 
@@ -473,16 +522,24 @@ static bool smit_try_reset(struct usb_device *udev, const char *why)
  * 已被证伪的手段：
  *   - 设备描述符 / 字符串 / vendor control 请求：冷热完全一样
  *     （bcdDevice=0200、iProduct="DONGLE"、几个 0xC0 请求一律 -11），零区分度。
- *   - 在 probe 里用 bulk 命令探活：冷芯片收不到应答时，探针的 5 个字节已经
- *     留在它的 OUT FIFO 里，紧跟着的唤醒包 FE 00 10 00 会被拼成畸形命令，
- *     握手必然失败（实测 4s / 10 次重发都冲不掉）-> probe 失败 -> 复位 ->
- *     重枚举 -> 再探测 -> 再污染，无限循环。
  *
- * 所以探活必须发生在 probe **之外**：模块初始化时、usb_register 之前先问一句。
- *   - 有应答 -> 记下 devnum，probe 时看到同一个 devnum 就直接注册（~0s）
- *   - 无应答 -> 是冷芯片，但探针已经弄脏了 FIFO。就地复位让它重新枚举成
- *              干净的冷芯片，之后 usb_register 触发的 probe 走正常唤醒+初始化。
- * 因为这时还没有注册 usb_driver，复位不会引起任何 probe，也就不可能循环。
+ * 探活（ping 0x82）现在放在两处，含义不同：
+ *   - module_init：usb_register 之前先问一句。有应答就记下 devnum，probe 看到
+ *     同一个 devnum 直接注册（~0s）。这时还没注册 usb_driver，就算要复位也
+ *     不会引起任何 probe，不可能循环。
+ *   - probe：拿不到凭据时（重新枚举 / 拔插 / reset 之后）再问一次。
+ *
+ * 曾经踩过的坑，现在的代码只是绕开、没有根除：早期在 probe 里探活之后
+ * **立刻发唤醒包**，冷芯片收不到应答时探针的 5 个字节还留在它的 OUT FIFO 里，
+ * 唤醒包 FE 00 10 00 被拼成畸形命令，握手必然失败（实测 4s / 10 次重发都冲
+ * 不掉），于是 probe 失败 -> 复位 -> 重枚举 -> 再探测 -> 再污染，无限循环。
+ * smit_flush_in() 只抽 IN，清不掉 OUT 的这一截。
+ *
+ * **未验证**：冷芯片在 ping 弄脏 FIFO 之后、不复位直接 wake 到底能不能成功。
+ * 我们记录到的两次冷启动里，一次是 8.06s（insmod 时设备还没枚举完，
+ * module_init 根本没找到设备，也就没 ping），另一次 ping 后面跟着一次复位
+ * （reset_on_cold 那条分支，节点 130.2s 才出来）。"ping 过 + 不复位 + wake"
+ * 这个组合没有数据，所以 reset_on_cold 默认仍然是开。
  */
 static int smit_pick_device(struct usb_device *udev, void *data)
 {
@@ -523,14 +580,19 @@ static void smit_recover_work_fn(struct work_struct *work)
 
 	if (udev) {
 		if (udev->state != USB_STATE_NOTATTACHED) {
-			pr_warn("dvb_usb_smit: command channel dead, resetting chip to re-enumerate\n");
+			pr_warn("dvb_usb_smit: command channel dead, attempting a recovery reset\n");
 			/* 复位后 devnum 会变，下一次 probe 因此不会命中"热芯片复用"，
 			 * 而是走完整冷启动。 */
 			smit_warm_devnum = -1;
 			smit_warm_busnum = -1;
-			if (smit_reset_allowed())
-				pr_warn("dvb_usb_smit: recovery reset returned %d\n",
-					smit_reset(udev));
+			/* 所有复位走同一个入口，代价判定才管得住这里。
+			 * 原来这里直接 smit_reset()：钉死成 reset_costly_ports 的
+			 * 端口照样被复位，而那支棒子实测要 806s（十三分钟）才回
+			 * 总线，且软复位救不回来（必须物理断电）——等于用十三分钟
+			 * 换一个还是不通的设备。拒绝复位时把话说明白，让人去断电，
+			 * 比静默熬着强。 */
+			if (!smit_try_reset(udev, "command channel dead"))
+				pr_warn("dvb_usb_smit: not resetting this port; power-cycle the dongle to recover\n");
 		}
 		usb_put_dev(udev);
 	}
@@ -591,17 +653,29 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 	 * 便宜的那支付 6.5s，贵的那支实测 806s。
 	 *
 	 * 判据就用初始化序列的第一条命令（req 0x82 只读查询）：热芯片 0ms 就回。
-	 * 失败先抽干 IN 再问一次，避免把上一条探针的残留应答当成这次的答案。 */
+	 * 没应答时先抽干 IN 再问一次，避免把上一条探针的残留应答当成这次的答案。 */
 	ret = smit_ping(udev);
-	if (ret) {
+	/* 只在"没应答"时重问一次：先抽干 IN，避免把上一条探针的残留当成
+	 * 这一次的答案。主机侧的瞬时错误（-ENOMEM 之类）重问也没有意义，
+	 * 它们不构成"冷"的证据，见 smit_ping_is_cold()。 */
+	if (smit_ping_is_cold(ret)) {
 		smit_flush_in(udev);
 		ret = smit_ping(udev);
 	}
-	if (!ret || !smit_is_transport_err(ret)) {
-		/* 有应答（哪怕是协议级怪数据）就说明固件在跑，直接注册。
+
+	if (ret == -ENODEV || ret == -ESHUTDOWN) {
+		dev_info(&udev->dev,
+			 "device is going away (%d), leaving it to re-enumerate\n",
+			 ret);
+		goto out;
+	}
+
+	if (!smit_ping_is_cold(ret)) {
+		/* 有应答（哪怕是协议级怪数据），或者错误根本不是"没回话"那一类：
+		 * 按热芯片处理，只注册、不动芯片 —— 唤醒包对热芯片是毒药。
 		 * 拿不到 tuner 信息，dtmb 用默认的双模配置。 */
 		dev_info(&udev->dev,
-			 "chip already initialized (ping %d), skipping wake + init\n",
+			 "chip looks alive (ping %d), skipping wake + init\n",
 			 ret);
 		goto register_device;
 	}
@@ -639,6 +713,15 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 				 ret);
 			goto out;
 		}
+		/* 只有"总线真的挂了"才值得复位。smit_wake 里 kmalloc 失败会返回
+		 * -ENOMEM，那种情况一个字节都没发出去，复位纯属白搭（在贵的批次上
+		 * 是分钟级），还可能把一颗好芯片重启掉。 */
+		if (!smit_is_bus_fault(ret)) {
+			dev_info(&udev->dev,
+				 "wake failed with %d, not a bus fault; leaving the chip alone\n",
+				 ret);
+			goto out;
+		}
 		if (smit_try_reset(udev, "device not responding to the wake packet"))
 			dev_info(&udev->dev, "device not responding (%d), reset to re-enumerate\n",
 				 ret);
@@ -666,9 +749,11 @@ do_init:
 			goto out;
 		}
 		/* 实验模式下不要复位：否则同一次 insmod 里会不断
-		 * 复位→重枚举→再失败，变成死循环 */
-		if (!smit_skip_wake)
-			smit_try_reset(udev, "init sequence failed at USB level");
+		 * 复位→重枚举→再失败，变成死循环。
+		 * 复位只对总线级故障有意义：-ENOMEM 这类主机侧失败
+		 * 一个字节都没发出去，复位纯属白搭。 */
+		if (!smit_skip_wake && smit_is_bus_fault(ret))
+			smit_try_reset(udev, "init sequence failed at bus level");
 		goto out;
 	}
 	if (ret)
@@ -683,14 +768,26 @@ register_device:
 		/* 一次成功的 probe 说明链路是好的，把自愈计数清零 */
 		smit_reset_attempts = 0;
 		/* 也是"复位代价判定"的正样本：复位后这么久之内能 probe 成功，
-		 * 说明这支设备的复位是便宜的（smit_reset_watch_fn 据此下结论） */
-		if (smit_pending_port[0])
-			smit_pending_ok = true;
+		 * 说明这支设备的复位是便宜的（smit_reset_watch_fn 据此下结论）。
+		 * 必须核对端口：pending 是单槽的，A 复位后紧跟着 B 又复位，
+		 * 随后 A probe 成功 —— 原来会把 B 的判决也刷成"便宜"，
+		 * 而那可能是要等十几分钟的那支。 */
+		if (smit_pending_port[0]) {
+			char port[SMIT_PORT_LEN];
+
+			smit_portname(udev, port, sizeof(port));
+			if (!strncmp(smit_pending_port, port, SMIT_PORT_LEN - 1))
+				smit_pending_ok = true;
+		}
 		goto out;
 	}
 
 	dev_err(&udev->dev, "dvb_usb_device_init failed: %d\n", ret);
-	smit_try_reset(udev, "dvb_usb_device_init failed");
+	/* 这里失败多半是主机侧的事（frontend attach 失败、内存不够、
+	 * adapter/demux 注册失败），复位芯片解决不了，却要付分钟级的代价。
+	 * 只有总线级故障才值得补这一刀。 */
+	if (smit_is_bus_fault(ret))
+		smit_try_reset(udev, "dvb_usb_device_init failed at bus level");
 out:
 	smit_in_probe = false;
 	return ret;
@@ -758,11 +855,14 @@ static int __init smit_module_init(void)
 			int i;
 
 			/* 冷芯片：探针可能弄脏了 FIFO，复位一次换来干净的重枚举。
-			 * 但这一步在有的批次上是分钟级（实测 806s），所以先问
-			 * smit_try_reset()：端口被钉死成 reset_costly_ports、或者
-			 * 本次加载已经判定过昂贵，就不复位，直接交给 usb_register
-			 * 之后的 probe（它会先 ping 再决定要不要唤醒）。 */
-			if (smit_try_reset(udev, "cold chip, cleaning the FIFO")) {
+			 * 但这只在 reset_on_cold=1 时才做 —— 复位代价实测 6.5s~806s
+			 * （同一行代码，同一型号，离散度 100 倍以上），而 probe 对
+			 * 冷芯片走 wake(最多 4 次) + init 只要 ~3s，完全不需要复位。
+			 * 真机实测：冷启动（整机断电上电）时本分支复位 1-1，节点从
+			 * 18.0s 被拖到 130.2s 才出现，其中 108s 全花在等重枚举。
+			 * 默认交给 usb_register 之后的 probe（它先 ping 再决定唤醒）。 */
+			if (smit_reset_on_cold &&
+			    smit_try_reset(udev, "cold chip, cleaning the FIFO")) {
 				/* 复位是"发完命令才重启"，实测要 ~0.8s 才真正从
 				 * 总线上消失。如果这时就去 usb_register，probe 会撞上
 				 * 一个正在重启的设备（-ENODEV），再触发一次复位。
@@ -776,7 +876,7 @@ static int __init smit_module_init(void)
 				char port[SMIT_PORT_LEN];
 
 				smit_portname(udev, port, sizeof(port));
-				pr_info("dvb_usb_smit: cold chip (ping %d) on %s, not resetting; probe will decide\n",
+				pr_info("dvb_usb_smit: cold chip (ping %d) on %s, will let probe wake it\n",
 					ret, port);
 			}
 		}
